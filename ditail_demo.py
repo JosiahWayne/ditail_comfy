@@ -11,7 +11,7 @@ import torchvision.transforms as T
 from transformers import logging
 from diffusers import DDIMScheduler, StableDiffusionPipeline
 
-from ditail_utils import *
+from .ditail_utils import *
 
 # filter warnings
 logging.set_verbosity_error()
@@ -25,38 +25,16 @@ class DitailDemo(nn.Module):
             setattr(self, k, v)
 
     def load_inv_model(self):
-        self.scheduler = DDIMScheduler.from_pretrained(self.inv_model, subfolder='scheduler')
-        self.scheduler.set_timesteps(self.inv_steps, device=self.device)
-        print(f'[INFO] Loading inversion model: {self.inv_model}')
-        pipe = StableDiffusionPipeline.from_pretrained(
-            self.inv_model, torch_dtype=torch.float16,
-            use_safetensors=self.inv_model.endswith('.safetensors')
-        ).to(self.device)
-        pipe.enable_xformers_memory_efficient_attention()
-        self.text_encoder = pipe.text_encoder
-        self.tokenizer = pipe.tokenizer
-        self.unet = pipe.unet
-        self.vae = pipe.vae
-        self.tokenizer_kwargs = dict(
-            truncation=True,
-            return_tensors='pt',
-            padding='max_length',
-            max_length=self.tokenizer.model_max_length
-        )
-    
-    def load_spl_model(self):
-        self.scheduler = DDIMScheduler.from_pretrained(self.spl_model, subfolder='scheduler')
-        self.scheduler.set_timesteps(self.spl_steps, device=self.device)
-        print(f'[INFO] Loading sampling model: {self.spl_model} (LoRA = {self.lora})')
-        if (self.lora != 'none') or (self.inv_model != self.spl_model):
+        if isinstance(self.inv_model, str):
+            self.scheduler = DDIMScheduler.from_pretrained(self.inv_model, subfolder='scheduler')
+            self.scheduler.set_timesteps(self.inv_steps, device=self.device)
+            print(f'[INFO] Loading inversion model: {self.inv_model}')
             pipe = StableDiffusionPipeline.from_pretrained(
-                self.spl_model, torch_dtype=torch.float16,
+                self.inv_model, torch_dtype=torch.float16,
                 use_safetensors=self.inv_model.endswith('.safetensors')
             ).to(self.device)
-            if self.lora != 'none':
-                pipe.load_lora_weights(self.lora_dir, weight_name=f'{self.lora}.safetensors')
-                pipe.fuse_lora(lora_scale=self.lora_scale)
-            pipe.enable_xformers_memory_efficient_attention()
+            if torch.cuda.is_available():
+                pipe.enable_xformers_memory_efficient_attention()
             self.text_encoder = pipe.text_encoder
             self.tokenizer = pipe.tokenizer
             self.unet = pipe.unet
@@ -67,6 +45,65 @@ class DitailDemo(nn.Module):
                 padding='max_length',
                 max_length=self.tokenizer.model_max_length
             )
+        else:
+            self.inv_model = self.inv_model.patch_model()
+            model_id = self.model_id_str
+            self.scheduler = DDIMScheduler.from_pretrained(model_id, subfolder='scheduler')
+            self.scheduler.set_timesteps(self.inv_steps, device=self.device)
+            print(f'[INFO] Using custom inversion model: {self.inv_model}')
+            self.text_encoder = self.inv_model.text_encoder
+            self.tokenizer = self.inv_model.tokenizer
+            self.unet = self.inv_model.unet
+            self.vae = self.inv_model.vae
+            self.tokenizer_kwargs = dict(
+                truncation=True,
+                return_tensors='pt',
+                padding='max_length',
+                max_length=self.tokenizer.model_max_length
+            )
+    
+    def load_spl_model(self):
+        if isinstance(self.spl_model, str):
+            self.scheduler = DDIMScheduler.from_pretrained(self.spl_model, subfolder='scheduler')
+            self.scheduler.set_timesteps(self.spl_steps, device=self.device)
+            print(f'[INFO] Loading sampling model: {self.spl_model} (LoRA = {self.lora})')
+            if (self.lora != 'none') or (self.inv_model != self.spl_model):
+                pipe = StableDiffusionPipeline.from_pretrained(
+                    self.spl_model, torch_dtype=torch.float16,
+                    use_safetensors=self.inv_model.endswith('.safetensors')
+                ).to(self.device)
+                if self.lora != 'none':
+                    pipe.load_lora_weights(self.lora_dir, weight_name=f'{self.lora}.safetensors')
+                    pipe.fuse_lora(lora_scale=self.lora_scale)
+                if torch.cuda.is_available():
+                    pipe.enable_xformers_memory_efficient_attention()
+                self.text_encoder = pipe.text_encoder
+                self.tokenizer = pipe.tokenizer
+                self.unet = pipe.unet
+                self.vae = pipe.vae
+                self.tokenizer_kwargs = dict(
+                    truncation=True,
+                    return_tensors='pt',
+                    padding='max_length',
+                    max_length=self.tokenizer.model_max_length
+                )
+        else:
+            self.spl_model = self.spl_model.patch_model()
+            model_id = self.model_id_str
+            self.scheduler = DDIMScheduler.from_pretrained(model_id, subfolder='scheduler')
+            self.scheduler.set_timesteps(self.spl_steps, device=self.device)
+            print(f'[INFO] Using custom sampling model: {self.spl_model} (LoRA = {self.lora})')
+            if (self.lora != 'none') or (self.inv_model != self.spl_model):
+                self.text_encoder = self.spl_model.text_encoder
+                self.tokenizer = self.spl_model.tokenizer
+                self.unet = self.spl_model.unet
+                self.vae = self.spl_model.vae
+                self.tokenizer_kwargs = dict(
+                    truncation=True,
+                    return_tensors='pt',
+                    padding='max_length',
+                    max_length=self.tokenizer.model_max_length
+                )
 
     @torch.no_grad()
     def encode_image(self, img_path):
@@ -155,6 +192,29 @@ class DitailDemo(nn.Module):
                 x = self.scheduler.step(noise_pred, t, x).prev_sample
             # save output latent
             self.output_latent = x
+
+    def run_ditail_comfy(self):
+        # init output dir & dump config
+        self.save_dir = get_save_dir(self.output_dir, self.img_path)
+        os.makedirs(self.save_dir, exist_ok=True)
+        # step 1: inversion stage
+        self.load_inv_model()
+        self.extract_latents()
+        self.latent_to_image(
+            latent=self.noisy_latent,
+            save_path=os.path.join(self.save_dir, 'noise.png')
+        )
+        # step 2: sampling stage
+        self.load_spl_model()
+        if not self.no_injection:
+            self.init_injection()
+        self.sampling_loop()
+        self.latent_to_image(
+            latent=self.output_latent,
+            save_path=os.path.join(self.save_dir, 'output.png')
+        )
+        return os.path.join(self.save_dir, 'output.png')
+        
 
     def run_ditail(self):
         # init output dir & dump config

@@ -1,74 +1,115 @@
-from comfy.model import SDXL, UNet1, BaseNode
-from comfy.prompt_layer import SimpleTextPrompt
-from torch import device
-from ditail_demo import DitailDemo
+import os
+import torch
+import numpy as np
+from types import SimpleNamespace
+from PIL import Image
+from .ditail_demo import DitailDemo
+from .ditail_utils import seed_everything
 
-class DitailNode(BaseNode):
-    TITLE = "Ditail Style Transfer"
-    TYPE = "ditail"
-    CATEGORY = "Image Processing"
-    
-    def __init__(self, node_id, graph):
-        super().__init__(node_id, graph)
-        # 定义输入 socket
-        self.add_input('source_model', type='MODEL', default='stablediffusionapi/realistic-vision-v51')
-        self.add_input('target_model', type='MODEL', default='stablediffusionapi/realistic-vision-v51')
-        self.add_input('image', type='IMAGE')
-        self.add_input('pos_prompt', type='PROMPT', default='a photo')
-        self.add_input('neg_prompt', type='PROMPT', default='blurry')
-        self.add_input('attn_ratio', type='FLOAT', default=0.5)
-        self.add_input('conv_ratio', type='FLOAT', default=0.8)
-        self.add_input('spl_steps', type='INT', default=50)
-        self.add_input('inv_steps', type='INT', default=50)
-        self.add_input('mask_type', type='STRING', default='full')
-        # 定义输出 socket
-        self.add_output('result_image', type='IMAGE')
 
-    def process(self, inputs):
-        # 从 inputs 拿参数
-        inv_model   = inputs['source_model']
-        spl_model   = inputs['target_model']
-        pil_img     = inputs['image']          # PIL.Image
-        pos_prompt  = inputs['pos_prompt']
-        neg_prompt  = inputs['neg_prompt']
-        attn_ratio  = inputs['attn_ratio']
-        conv_ratio  = inputs['conv_ratio']
-        spl_steps   = inputs['spl_steps']
-        inv_steps   = inputs['inv_steps']
-        mask_type   = inputs['mask_type']
+class DitailStyleTransfer:
+    CATEGORY = "Ditail"
 
-        # 构造 args
-        class Args: pass
-        args = Args()
-        args.inv_model   = inv_model
-        args.spl_model   = spl_model
-        args.img_path    = None     # we'll feed PIL directly
-        args.pos_prompt  = pos_prompt
-        args.neg_prompt  = neg_prompt
-        args.attn_ratio  = attn_ratio
-        args.conv_ratio  = conv_ratio
-        args.spl_steps   = spl_steps
-        args.inv_steps   = inv_steps
-        args.mask        = mask_type
-        args.output_dir  = '/tmp'   # 临时输出
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            # 模型
+            "source_model": ("STRING", {"default": "stablediffusionapi/realistic-vision-v51"}),
+            "target_model": ("STRING", {"default": "stablediffusionapi/realistic-vision-v51"}),
 
-        # 初始化 Ditail
+            # 原图
+            "image":        ("IMAGE",),
+            # 随机种子
+            "seed":         ("INT",    {"default": 42}),
+            # 正/负 prompt
+            "pos_prompt":   ("STRING", {"default": "a photo"}),
+            "neg_prompt":   ("STRING", {"default": "worst quality, blurry, NSFW"}),
+            # 反演/采样步数
+            "inv_steps":    ("INT",    {"default": 50, "min": 1, "max": 200}),
+            "spl_steps":    ("INT",    {"default": 50, "min": 1, "max": 200}),
+            # 权重系数
+            "alpha":        ("FLOAT",  {"default": 2.0, "min": 0.0, "max": 10.0}),
+            "beta":         ("FLOAT",  {"default": 0.5, "min": 0.0, "max": 10.0}),
+            "omega":        ("FLOAT",  {"default": 15.0,"min": 0.0, "max": 50.0}),
+            # PnP 注入参数
+            "attn_ratio":   ("FLOAT",  {"default": 0.5, "min": 0.0, "max": 1.0}),
+            "conv_ratio":   ("FLOAT",  {"default": 0.8, "min": 0.0, "max": 1.0}),
+            "mask_type":    ("STRING", {"default": "full"}),
+            # LoRA 支持
+            "lora":         ("STRING", {"default": "none"}),
+            "lora_dir":     ("STRING", {"default": "./lora"}),
+            "lora_scale":   ("FLOAT",  {"default": 0.7, "min": 0.0, "max": 5.0}),
+        }}
+
+    RETURN_TYPES  = ("IMAGE",)
+    RETURN_NAMES  = ("result_image",)
+    FUNCTION      = "run"
+
+    @staticmethod
+    def tensor_to_pil(t):
+        t = t[0].clamp(0, 1) if isinstance(t, torch.Tensor) else t[0]
+        arr = (t * 255).byte().cpu().numpy() if isinstance(t, torch.Tensor) \
+              else (t * 255).astype(np.uint8)
+        return Image.fromarray(arr)
+
+    @staticmethod
+    def pil_to_tensor(img: Image.Image, dtype=torch.float32, device="cpu"):
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+        tensor = torch.from_numpy(arr).to(device, dtype)
+        return tensor.unsqueeze(0)
+
+    def run(self, source_model, target_model, image,
+            seed, pos_prompt, neg_prompt,
+            inv_steps, spl_steps,
+            alpha, beta, omega,
+            attn_ratio, conv_ratio, mask_type,
+            lora, lora_dir, lora_scale,
+            no_injection=False):
+
+        # 1) 设定种子
+        seed_everything(seed)
+        # print(dir(source_model.patch_model()), dir(source_model.patch_model().name))
+        # 设定采样器)
+        # 2) 准备临时目录
+        temp_dir = "./temp"
+        os.makedirs(temp_dir, exist_ok=True)
+
+        # 3) Tensor → PIL → 存盘
+        pil_img    = DitailStyleTransfer.tensor_to_pil(image)
+        in_path    = os.path.join(temp_dir, "input.png")
+        pil_img.save(in_path)
+
+        # 4) 构造 args
+        device_str = "cuda" if torch.cuda.is_available() else "mps"
+        args = SimpleNamespace(
+            seed        = seed,
+            device      = device_str,
+            output_dir  = temp_dir,
+            inv_model   = source_model,
+            spl_model   = target_model,
+            img_path    = in_path,
+            pos_prompt  = pos_prompt,
+            neg_prompt  = neg_prompt,
+            alpha       = alpha,
+            beta        = beta,
+            omega       = omega,
+            inv_steps   = inv_steps,
+            spl_steps   = spl_steps,
+            mask        = mask_type,
+            lora        = lora,
+            lora_dir    = lora_dir,
+            lora_scale  = lora_scale,
+            no_injection= no_injection,
+        )
+
+        # 5) 调用 DitailDemo
         ditail = DitailDemo(args)
-        # 直接 encode PIL ➔ latent
-        latent = ditail.encode_image(pil_img)
-        ditail.load_inv_model()
-        # 执行反演
-        cond = ditail.extract_latents_from_prompts()
-        ditail.invert_image(cond, latent)
-        # 执行采样
-        ditail.load_spl_model()
-        ditail.init_injection(attn_ratio, conv_ratio)
-        ditail.sampling_loop()
-        # 解码回 PIL
-        out_pil = ditail.latent_to_image(ditail.output_latent)
+        out_path = ditail.run_ditail_comfy()
 
-        return {'result_image': out_pil}
+        # 6) 读取结果 → Tensor 返回
+        out_pil    = Image.open(out_path).convert("RGB")
+        out_tensor = DitailStyleTransfer.pil_to_tensor(out_pil, device=device_str)
 
-# 最后一步：让 ComfyUI 知道这个节点
-def register_nodes():
-    return [DitailNode]
+        return (out_tensor,)
