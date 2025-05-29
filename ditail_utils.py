@@ -112,7 +112,7 @@ def register_attn_inj(model, injection_schedule):
 
 def register_conv_inj(model, injection_schedule):
     def conv_forward(self):
-        def forward(input_tensor, temb, scale):
+        def forward(input_tensor, temb, scale=1): # question, why do we have a scale here?
             hidden_states = input_tensor
             hidden_states = self.norm1(hidden_states)
             hidden_states = self.nonlinearity(hidden_states)
@@ -125,7 +125,8 @@ def register_conv_inj(model, injection_schedule):
             elif self.downsample is not None:
                 input_tensor = self.downsample(input_tensor, scale=scale)
                 hidden_states = self.downsample(hidden_states, scale=scale)
-            hidden_states = self.conv1(hidden_states, scale)
+            # hidden_states = self.conv1(hidden_states, scale)
+            hidden_states = self.conv1(hidden_states)
             if temb is not None:
                 temb = self.time_emb_proj(self.nonlinearity(temb))[:, :, None, None]
             if temb is not None and self.time_embedding_norm == "default":
@@ -136,7 +137,8 @@ def register_conv_inj(model, injection_schedule):
                 hidden_states = hidden_states * (1 + scale) + shift
             hidden_states = self.nonlinearity(hidden_states)
             hidden_states = self.dropout(hidden_states)
-            hidden_states = self.conv2(hidden_states, scale)
+            # hidden_states = self.conv2(hidden_states, scale)
+            hidden_states = self.conv2(hidden_states)
             if self.injection_schedule is not None and (self.t in self.injection_schedule or self.t == 1000):
                 bs = int(hidden_states.shape[0] // 3)
                 if self.mask_type != 'full':
@@ -148,7 +150,8 @@ def register_conv_inj(model, injection_schedule):
                 # inject neg chunk
                 hidden_states[2*bs:] = mask * hidden_states[:bs] + (1-mask) * hidden_states[2*bs:]
             if self.conv_shortcut is not None:
-                input_tensor = self.conv_shortcut(input_tensor, scale)
+                # input_tensor = self.conv_shortcut(input_tensor, scale)
+                input_tensor = self.conv_shortcut(input_tensor)
             output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
             return output_tensor
         return forward

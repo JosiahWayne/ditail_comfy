@@ -33,8 +33,8 @@ class DitailDemo(nn.Module):
                 self.inv_model, torch_dtype=torch.float16,
                 use_safetensors=self.inv_model.endswith('.safetensors')
             ).to(self.device)
-            if torch.cuda.is_available():
-                pipe.enable_xformers_memory_efficient_attention()
+            # if torch.cuda.is_available():
+            #     pipe.enable_xformers_memory_efficient_attention()
             self.text_encoder = pipe.text_encoder
             self.tokenizer = pipe.tokenizer
             self.unet = pipe.unet
@@ -75,8 +75,8 @@ class DitailDemo(nn.Module):
                 if self.lora != 'none':
                     pipe.load_lora_weights(self.lora_dir, weight_name=f'{self.lora}.safetensors')
                     pipe.fuse_lora(lora_scale=self.lora_scale)
-                if torch.cuda.is_available():
-                    pipe.enable_xformers_memory_efficient_attention()
+                # if torch.cuda.is_available():
+                #     pipe.enable_xformers_memory_efficient_attention()
                 self.text_encoder = pipe.text_encoder
                 self.tokenizer = pipe.tokenizer
                 self.unet = pipe.unet
@@ -206,6 +206,7 @@ class DitailDemo(nn.Module):
         )
         # step 2: sampling stage
         self.load_spl_model()
+        print(f'[INFO] injection = {self.no_injection}')
         if not self.no_injection:
             self.init_injection()
         self.sampling_loop()
